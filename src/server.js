@@ -1,27 +1,36 @@
-const fastify = require("fastify")
-const Redis = require('ioredis');
+const dotenv = require('dotenv');
+dotenv.config();
+const fastify = require("fastify");
 const pgp = require('pg-promise')();
-const amqp = require('amqplib');
+const { connect } = require('nats');
 
-async function connectRabbitMQ() {
-  const connection = await amqp.connect('amqp://user:queue_pass@localhost:5672');
-  const channel = await connection.createChannel();
-  await channel.assertQueue('transacoesQueue');
-  return { connection, channel };
+class Queue {
+  static instance = null
+
+  static async getInstance() {
+    if (!Queue.instance) {
+      this.instance = await connect({ servers: process.env.QUEUE_URL })
+      return this.instance
+    }
+
+    return this.instance
+  }
 }
 
 const dbConfig = {
-  host: 'localhost',
-  port: 5432,
-  database: 'bank',
-  user: 'postgres',
-  password: 'postgres',
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
   max: 10,
   idleTimeoutMillis: 30000,
 };
+
+Queue.getInstance()
+
 const database = pgp(dbConfig);
-const redis = new Redis({ host: 'localhost', port: 6379 });
-const server = fastify()
+const server = fastify();
 
 server.post('/clientes', async (req, res) => {
   const { body } = req
@@ -31,30 +40,20 @@ server.post('/clientes', async (req, res) => {
   } catch (err) {
     return res.status(500).send({ message: err.message })
   }
-})
+});
 
 server.post('/clientes/:id/transacoes', async (req, res) => {
   const { body, params } = req
-  const { channel: queueChannel } = await connectRabbitMQ();
-
+  if (![1,2,3,4,5].includes(parseInt(params.id))) throw new Error('Cliente não encontrado');
   try {
-    let customer = null
-    const customerCached = await redis.get(`customer:${params.id}`)
-    if (customerCached) {
-      customer = JSON.parse(customerCached)
-    } else {
-      const [customerDatabase] = await database.query('SELECT * FROM clientes WHERE id = $1', [params.id]);
-      customer = customerDatabase
-    }
-    if (!customer) {
-      throw new Error('Cliente não encontrado');
-    }
-    const balanceUpdated = customer.saldo - body.valor;
-    if (balanceUpdated < -customer.limite) {
-      throw new Error('Saldo insuficiente');
-    }
+    const [customer] = await database.query('SELECT * FROM clientes WHERE id = $1', [params.id]);
+    if (!customer) throw new Error('Cliente não encontrado');
+    // validate balance
+    const balanceUpdated = body.tipo === "d" ? customer.saldo - body.valor : customer.saldo + body.valor;
+    if (balanceUpdated < -customer.limite) throw new Error('Saldo insuficiente');
+    const queue = await Queue.getInstance()
 
-    queueChannel.sendToQueue('transacoesQueue', Buffer.from(JSON.stringify({ customerId: params.id, ...body })))
+    queue.publish('transacoesQueue', JSON.stringify({ customerId: params.id, ...body }));
 
     return res.status(200).send({
       saldo: balanceUpdated,
@@ -72,74 +71,33 @@ server.post('/clientes/:id/transacoes', async (req, res) => {
     }
     return res.status(500).send({ message: err.message })
   }
-})
+});
 
 server.get('/clientes/:id/extrato', async (req, res) => {
   const { params } = req
-  const cacheKey = `extract:${params.id}`
   try {
-    const cachedData = await redis.get(cacheKey);
-    if (cachedData) {
-      return res.status(200).send(JSON.parse(cachedData))
-    }
     const [customer] = await database.query('select * from clientes where id = $1', [params.id])
     if (!customer) {
       return res.status(404).send()
     }
-    const transactions = await database.query('select valor, tipo, descricao, realizada_em from transacoes where cliente_id = $1', [params.id])
-    const result = {
+    const transactions = await database.query('select valor, tipo, descricao, realizada_em from transacoes where cliente_id = $1 ORDER BY realizada_em DESC LIMIT 10', [params.id])
+    return res.status(200).send({
       "saldo": {
         "total": customer.saldo,
         "data_extrato": new Date().toISOString(),
         "limite": customer.limite
       },
       "ultimas_transacoes": transactions
-    }
-    await redis.set(cacheKey, JSON.stringify(result), 'EX', 3600);
-    return res.status(200).send(result)
+    })
   } catch (err) {
     return res.status(500).send({ message: err.message })
   }
-})
+});
 
-server.listen({ port: 3333 }, (err, address) => {
-  if (err) throw err
-  console.log("Server is running")
-})
-
-async function transactionQueueConsumer() {
-  const { channel } = await connectRabbitMQ();
-  let customerUpdated = null
-  channel.consume('transacoesQueue', async message => {
-    try {
-      const transactionDetails = JSON.parse(message.content.toString());
-      await database.tx(async t => {
-        const [customer] = await t.query('SELECT * FROM clientes WHERE id = $1', [transactionDetails.customerId]);
-        if (!customer) {
-          throw new Error('Cliente não encontrado');
-        }
-        const balanceUpdated = customer.saldo - transactionDetails.valor;
-        if (balanceUpdated < -customer.limite) {
-          throw new Error('Saldo insuficiente');
-        }
-        await t.query('INSERT INTO transacoes (cliente_id, valor, tipo, descricao, realizada_em) VALUES ($1, $2, $3, $4, $5)', [transactionDetails.customerId, transactionDetails.valor, transactionDetails.tipo, transactionDetails.descricao, new Date().toISOString()]);
-
-        const updateResult = await t.query('UPDATE clientes SET saldo = $1, versao = versao + 1 WHERE id = $2 AND versao = $3', [balanceUpdated, transactionDetails.customerId, customer.versao]);
-        if (updateResult.rowCount === 0) {
-          throw new Error('Os dados do cliente foram alterados, tente novamente.');
-        }
-        customerUpdated = { ...customer, saldo: balanceUpdated, versao: customer.versao + 1 }
-      });
-
-      await redis.del(`extract:${transactionDetails.customerId}`)
-      if (customerUpdated) {
-        await redis.set(`customer:${transactionDetails.customerId}`, JSON.stringify(customerUpdated))
-      }
-      channel.ack(message);
-    } catch (err) {
-      console.log(err.message)
-    }
-  });
-}
-
-transactionQueueConsumer()
+server.listen({
+  host: '0.0.0.0',
+  port: process.env.PORT
+}, (err, address) => {
+  if (err) throw err;
+  console.log(`Server is running at ${address}`);
+});
