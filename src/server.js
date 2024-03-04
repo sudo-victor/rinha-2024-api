@@ -39,7 +39,7 @@ server.post('/clientes/:id/transacoes', async (req, res) => {
 
         const pipeline = redis.pipeline();
         const transactionId = await redis.incr('transactionId');
-        pipeline.hmset(`transacao:${transactionId}`, {
+        pipeline.hmset(`transacao:${transactionId}:cliente_id:${params.id}`, {
             cliente_id: params.id,
             valor: body.valor,
             tipo: body.tipo,
