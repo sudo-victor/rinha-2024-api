@@ -18,13 +18,23 @@ const database = pgp(dbConfig);
 const server = fastify();
 
 server.post('/clientes', async (req, res) => {
-  const { body } = req
-  try {
-    const result = await database.query('insert into clientes (nome, limite, saldo) values ($1, $2, $3)', [body.nome, body.limite, body.saldo])
-    return res.status(201).send({ result })
-  } catch (err) {
-    return res.status(500).send({ message: err.message })
-  }
+    const { body } = req;
+    if (!body.nome || !body.limite || body.saldo == null) {
+        return res.status(400).send({ message: 'Invalid request data' });
+    }
+    try {
+        const pipeline = redis.pipeline();
+        const clientId = await redis.incr('clienteId');
+        pipeline.hmset(`cliente:${clientId}`, {
+            nome: body.nome,
+            limite: body.limite,
+            saldo: body.saldo
+        });
+        await pipeline.exec();
+        return res.status(201).send({ clienteId: clientId });
+    } catch (err) {
+        return res.status(500).send({ message: err.message });
+    }
 });
 
 server.post('/clientes/:id/transacoes', async (req, res) => {
@@ -81,30 +91,35 @@ server.post('/clientes/:id/transacoes', async (req, res) => {
 
 
 server.get('/clientes/:id/extrato', async (req, res) => {
-  const { params } = req
-  try {
-    const [customer] = await database.query('select * from clientes where id = $1', [params.id])
-    if (!customer) {
-      return res.status(404).send()
+    const { params } = req;
+    try {
+        const customer = await redis.hgetall(`cliente:${params.id}`);
+        if (!customer || !customer.nome) {
+            return res.status(404).send();
+        }
+
+        const transactionKeys = await redis.keys(`transacao:*:cliente_id:${params.id}`);
+        const transactions = await Promise.all(transactionKeys.map(key => redis.hgetall(key)));
+        transactions.sort((a, b) => new Date(b.realizada_em) - new Date(a.realizada_em));
+
+        return res.status(200).send({
+            "saldo": {
+                "total": customer.saldo,
+                "data_extrato": new Date().toISOString(),
+                "limite": customer.limite
+            },
+            "ultimas_transacoes": transactions.slice(0, 10)
+        });
+    } catch (err) {
+        console.log("ERROR: /clientes/:id/extrato: ", err.message)
+        return res.status(500).send({ message: err.message });
     }
-    const transactions = await database.query('select valor, tipo, descricao, realizada_em from transacoes where cliente_id = $1 ORDER BY realizada_em DESC LIMIT 10', [params.id])
-    return res.status(200).send({
-      "saldo": {
-        "total": customer.saldo,
-        "data_extrato": new Date().toISOString(),
-        "limite": customer.limite
-      },
-      "ultimas_transacoes": transactions
-    })
-  } catch (err) {
-    return res.status(500).send({ message: err.message })
-  }
 });
 
 server.listen({
-  host: '0.0.0.0',
-  port: process.env.PORT
+    host: '0.0.0.0',
+    port: process.env.PORT
 }, (err, address) => {
-  if (err) throw err;
-  console.log(`Server is running at ${address}`);
+    if (err) throw err;
+    console.log(`Server is running at ${address}`);
 });
