@@ -2,20 +2,7 @@ const dotenv = require('dotenv');
 dotenv.config();
 const fastify = require("fastify");
 const pgp = require('pg-promise')();
-const { connect } = require('nats');
-
-class Queue {
-  static instance = null
-
-  static async getInstance() {
-    if (!Queue.instance) {
-      this.instance = await connect({ servers: process.env.QUEUE_URL })
-      return this.instance
-    }
-
-    return this.instance
-  }
-}
+const yup = require("yup")
 
 const dbConfig = {
   host: process.env.DB_HOST,
@@ -26,8 +13,6 @@ const dbConfig = {
   max: 10,
   idleTimeoutMillis: 30000,
 };
-
-Queue.getInstance()
 
 const database = pgp(dbConfig);
 const server = fastify();
@@ -43,35 +28,57 @@ server.post('/clientes', async (req, res) => {
 });
 
 server.post('/clientes/:id/transacoes', async (req, res) => {
-  const { body, params } = req
-  if (![1,2,3,4,5].includes(parseInt(params.id))) throw new Error('Cliente não encontrado');
-  try {
-    const [customer] = await database.query('SELECT * FROM clientes WHERE id = $1', [params.id]);
-    if (!customer) throw new Error('Cliente não encontrado');
-    // validate balance
-    const balanceUpdated = body.tipo === "d" ? customer.saldo - body.valor : customer.saldo + body.valor;
-    if (balanceUpdated < -customer.limite) throw new Error('Saldo insuficiente');
-    const queue = await Queue.getInstance()
+  const { body, params } = req;
 
-    queue.publish('transacoesQueue', JSON.stringify({ customerId: params.id, ...body }));
+  // Validação rápida do ID antes de prosseguir
+  if (!parseInt(params.id)) {
+    return res.status(400).send({ message: 'ID de cliente inválido' });
+  }
+
+  const bodyValidator = yup.object({
+    valor: yup.number().required(),
+    descricao: yup.string().max(10).required(),
+    tipo: yup.string().oneOf(["d", "c"]).required(),
+  });
+
+  try {
+    await bodyValidator.validate(body);
+  } catch (err) {
+    return res.status(400).send({ message: err.errors });
+  }
+
+  try {
+    await database.tx(async t => {
+      const customer = await t.one('SELECT * FROM clientes WHERE id = $1', params.id);
+
+      const balanceUpdated = body.tipo === "d" ? customer.saldo - body.valor : customer.saldo + body.valor;
+      if (balanceUpdated < -customer.limite) {
+        throw new Error('Saldo insuficiente');
+      }
+
+      await t.query('INSERT INTO transacoes (cliente_id, valor, tipo, descricao, realizada_em) VALUES ($1, $2, $3, $4, NOW())', [params.id, body.valor, body.tipo, body.descricao]);
+      const updateResult = await t.query('UPDATE clientes SET saldo = $1, versao = versao + 1 WHERE id = $2 AND versao = $3', [balanceUpdated, params.id, customer.versao]);
+      if (updateResult.rowCount === 0) {
+        throw new Error('Os dados do cliente foram alterados, tente novamente.');
+      }
+    });
 
     return res.status(200).send({
-      saldo: balanceUpdated,
-      limite: customer.limite
-    })
+      message: 'Transação realizada com sucesso'
+    });
   } catch (err) {
-    if (err.message === 'Cliente não encontrado') {
-      return res.status(404).send({ message: err.message })
+    switch (err.message) {
+      case 'Cliente não encontrado':
+        return res.status(404).send({ message: err.message });
+      case 'Saldo insuficiente':
+      case 'Os dados do cliente foram alterados, tente novamente.':
+        return res.status(422).send({ message: err.message });
+      default:
+        return res.status(500).send({ message: 'Erro no servidor' });
     }
-    if (err.message === 'Saldo insuficiente') {
-      return res.status(422).send({ message: err.message })
-    }
-    if (err.message === 'Os dados do cliente foram alterados, tente novamente.') {
-      return res.status(422).send({ message: err.message })
-    }
-    return res.status(500).send({ message: err.message })
   }
 });
+
 
 server.get('/clientes/:id/extrato', async (req, res) => {
   const { params } = req
